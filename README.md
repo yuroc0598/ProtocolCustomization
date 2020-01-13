@@ -25,7 +25,7 @@
 
 
 
-## Project III: Fuzzing
+## Project III: Protocol Fuzzing
 
 **Some introduction**
 
