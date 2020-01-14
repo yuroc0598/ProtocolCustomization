@@ -1,0 +1,2 @@
+AFL_DONT_OPTIMIZE=1 AFL_USE_ASAN=1 ../../afl-clang-fast  -fsanitize=address -Iinclude -o openssl3 openssl.c libssl.a libcrypto.a -ldl 
+#afl-clang-fast  -fsanitize=address -Iinclude -o openssl openssl.c libssl.a libcrypto.a -ldl 

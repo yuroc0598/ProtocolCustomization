@@ -1,0 +1,176 @@
+Protocol Progressive Fuzzing:
+
+----------------------------------------------------------------------------------------------------------------------------------
+Overview:
+
+----------------------------------------------------------------------------------------------------------------------------------
+1) share progress with fuzzer using shared mem, trace_bits:
+
+init : when shm is created, add one more byte at the end, init it to 0, this is for the "c" value in testing program. (how does TP load and write to this shm? currently TP load by default, so don't load it again.)
+
+
+
+TP write: when the value of c in testing program changes, write to the last byte of shm, (fork server will compare the value of c after each TP with the global prev_c, if it changes, proceed the fuzzing), also, write current reponse p2 to file, new_p2,
+
+fuzzer read: every time after fuzzing, (in fuzz_common_stuff), read from shm, check if the value of c changes, if so, save the current fuzzing input to prev_p1, also read p2 from the file new_p2 and put it into Q2, increment the fuzzing Q from Q1 to Q2
+
+commute: when c changes in TP, TP will increment the value of fixed fuzzing step, "step", (at this moment, fork server is already on, how to reset it, or just leave it and continue fuzzing the next stage?) we can keep the forking server stuff, next time TP is launched, use the prev_p1 for p1, and newly fuzzed p2 from fuzzer for p2
+
+
+
+
+
+
+Hands on:
+
+----------------------------------------------------------------------------------------------------------------------------------
+
+*) store a chain of packets instead of a single packet if crash happens.
+
+
+Done:
+
+----------------------------------------------------------------------------------------------------------------------------------
+*) add seed[] to store the testcases that are worthy of progression but not used yet
+*) change implementation to first fuzz each packet a fixed time, say one hour, store the queue number and seed, than adjust the power searching based on them.
+
+*) save bitmap for every progression and regression: use the proceed_times and regress_times for names;
+*) use a global variable to store the last testcase, only update it when progress happens; if doing this, then the TP will need to determine when to read from last packet, still overhead.
+*) do we need to clear the extra bitmap explored by p2 when regressing to p1; how to let p1 still explore those cases, we maintain four virgin bits?
+
+
+
+*) the CPU% is high, something is wrong, there should be alway only 1 core busy. the htop says that the openssl is not killed. not the problem of openssl.c, it's the llvm pass.
+
+*) we can modidy the LLVM pass, to enable multiple fork. In the pass code, setup the shm first, then read the step value from shm. Everytime the Openssl TP encounters the "__AFL_INIT", it will call forkserver logic. By default, the fs will be initialized when step==1 and init_done is set to 1, fs logic will never be called again. Now, add a condition to enable multi forks. Add a global value to count the times "__AFL_INIT" has occured (init_count), then the condition should be shm[MAP_SIZE] == init_count+1. In this case, at first when fuzzing p1, the fs is up and child is forked. And now fs is in the infinite while loop waiting for another signal, when it comes and shm[MAP_SIZE]==2, it will fork, and encounter the second "__AFL_INIT" in the openssl TP source code, which calls to init fs again, this time, step is 2, and the fs will fork again, setup fds, (parent should close fds). When regressing, the fs will find that init_count > step, so it needs to kill itself and close the fds and send signal to parent (which is the fs forking p1).
+
+
+*) fuzzer will pass -1 to shm if it wants to regress, then TP will receive that and exit with code 321, when its parents, say Q2 sees 321, it will jump out of while loop and continue execute, to let its parents Q1 take control.
+
+*) now use 2 bytes in shm to store c and step
+
+*) timeout when proceed to Q2, when perform dry run: this may caused by the waitpid of forked p1, say, p1 just forked and wait for the child to exit as usual, and p1 already sent the pid of forked p1 to fuzzer, it does not know that this forked p1 will dive into p2. After p2 calls another afl_forkserver, it writes the result of forked p2 to pipe, however, in the fuzzer side, the fuzzer is waiting using waitpid() using the pid of forked p1: we can use init_count together with shm[MAP_SIZE] as a condition in afl_forkserver to stop forked p1 send pid to parent, if(init_count>shm[MAP_SIZE])
+
+*) also need to change read, when fs finds that init_count < step, it should not read from the pipe, instead, let the forked kid read it.
+
+*) still timeout: the problem is that, openssl TP fs1 keeps reading and looping, even if fuzzer says it wants to proceed and put the next Qid in shm, but fs already is earlier than this and already has previous step value in it, there is a race condition. e.g., fs1 read from the shm first, then read from pipe, will keep fuzzing q1: try to use pipe to send the step value
+
+
+
+
+
+*) maybe update the bitmap priority policy, the packet that generate larger c value get more air time. check where is update_bitmap_score used: I add save_if_interesting into the new packet branch in common_fuzz_stuff, so that when new packets come, it won't directly jump to main loop to proceed, but will save the current testcase if favored. maybe add more weight on the perf score it has? something like invoke_new_packet(). I add the member invoke_new_packet to each queue entry, then update the value in has_new_packet, then cal the perf score in calculate score, make them the max value of havoc time.
+
+*) maybe need to change the timing policy here, otherwise will AFL consider proceed fuzzing time as the time of the last testcase?: check how is the time for each execution measured: exec time is only calculated in calibrate_case, that's why it's called calibrated case. In this case, we dont have to worry about the air time, cali case will be called every time save_if_intere, so won't be affected by proceed. hopefully.
+
+
+
+
+1) how to obtain addr of shm in TP, during instrumentation, afl-clang-fast already does the shmat. (Check where does the binary write bitmap, after that, write c?)
+  - why not use environment var?: no, env var are set before process starts and can only be seen by children
+  - read SHM_EVN_VAR, in TP, use shmat again, basically, map the shm twice. 
+
+2) How is c used in fuzzer:
+    - add has_new_packet()
+	- fuzzer will send step value to shm every execute: when to change the value?
+
+	- some basic logic when new packets are seen: (when interesting p1 activate them all), let the fuzzer commands, though some operation could be done either on fuzzer side or TP side. Let the fuzzer decide the step and TP just read it and do what it says:
+		- fuzzer: 1) change shm, set "step" value; 2) put current p2 into Q2, p2 is the response caused by interesting p1; 3) jump out of current fuzzing loop and fuzz on Q2, still put the mutated p2 into "input" file
+		- TP: 1) every time write p1 to f_p1, p2 to f_p2; 2) read from shm, change the value of step; 3) for packets before "step", use the file p1, p2 to overwrite the generated packets, for the packet right on "step", use the fuzzed "input" file.
+
+
+3) when to use switch_to_Q() and proceed_fuzzing():
+	- how to jump out of current fuzzing and proceed: the function common_fuzz_stuff, will return 1 if it is time to bail out, so just ask it to bail out if has_new_packet. The label it will go to is abandon_entry. So we should return 2 if new packets are seen, then in the main while loop, deal with 2, call proceed_fuzzing to change target Q.
+
+4) our resume is different from AFL resume, AFL resume take old output queue as input and start all new fuzzing, our resume is in memory resume, directly start from where it pauses. So we dont need to find_start_position, the problem is set up dir? maybe dont need to set up dir
+
+
+
+
+4) Implement Q:
+
+	- what are those vars of queue that can be directly replaced with Q, and what are those need to use addition, or complete restore.
+    - Make sure that switch_to_Q is called before add_to_Q, cz in add_to_Q, the globals are not checked, must be the globals from the right Q; also check when is the queue entry written to file in the dir "out_dir/queue", cz we need to do the same when reading the q2: It's in function pivot_inputs(), add it to the read_next_packet() when first switches to some Q;
+    - the var Q_havoc_div need to be init when the struct Q is created;
+    - top_rated needs to be taken care of separatedly, if we maintain multiple top_rated, then make the global one a pointer, when switch_to_Q, change the value of top_rated, but in store_Q, there is no need to change the top_rated. Check whether a pointer of top_rated would cause any problem in exisiting AFL impl.
+    - do not forget to create Q1 at the beginning;
+	- I/O stuff needs to be updated:
+        - the -i input takes the PROG/in, then based on the packet to fuzz, the real input folder is PROG/in/px, and add '-p' option to AFL. So update the in_dir, out_dir. Use a global var to store the value of p, e.g., Qid. And check where do in_dir, out_dir used, update them. or use two more var to represent the raw in and out passed by -i and -o, then make in_dir = in + qid,
+        - use setup_dirs_fds then use pivot_input when creating a new Q; clean up the out_dir when destroy Q
+
+
+
+
+5) TP:
+	- need to let TP fuzz according to the step value, e.g., if c is smaller than step, then just ask it to read from the packets written previously
+	- make the name of written packet the same, "packet", distinguish them by the folder they are in.
+
+
+6) back-track fuzzing
+	- when to stop current fuzzing step and back track?: when the new Q, say, Q2, has finished one or two circle? or when the tracebits have not changed for a long time
+	- how to do backtrack?  step value decreases by 2, save current Q, switch to lower Q,
+	- rethink the value of decrease and increase of step value again, suppose at first we only have c=2, then next time c=4; or from c=2 then c=3, how to determine the change of step value: set a min(1) and max(6) value for c, then check it in has_new_packet.
+
+7) maybe_delete_dirs_fds does not do the job. the folder is not clean. need to force remove files or backup them then remove. the problem happens when try to remove Q2 when regressing fuzzing, but the out_dir related to Q2 is the currently active one, so there's a lock on it.
+
+8) problem with alloc_printf and ck_free when reallocate the Qid_str_cur and in_dir and out_dir: check where is in_dir alloced and freeed; debug line 1486, check if queue is created; pivot_input changed the mem before fn; the reason is that in pivot_input, the q->fname is ck_freed and points to the new file link in out_dir, which means that after pivot_input, the q->fname will be normal mem without ck buf, it also means that a q->fname should be initialized using ck_alloc.
+	- in switch_to_Q, simply put queue = Q->Qhead, will not work, later queue is assigned using malloc in add_to_queue, so Q->Qhead remains NULL.
+	- after proceed_fuzzing, we are in Q2, when go back to main, in the while loop, cull_queue is called, in mark_as_redundant, the fname of queue is corrupted, find out where is it changed in proceed_fuzzing: it's in show_stats in proceed_fuzzing,
+	- in switch_to_Q, if old>new, how to set resume: set te resume flag
+	- do we need to init queue_cur when construct Q and switch_to_Q; check where does queue_cur assigned in default AFL
+	- check what does find_start_position do, maybe copy this function into the main while loop
+	- need to write fuzzer_stats (to old) when switch from old to new, if new is larger than old; and maybe in switch_to_Q and store Q, backup Q-related coverage info
+	- check how is virgin_bits used, where is it updated, and maybe update it when regressing, if the information is lost. but looks like the virgin map info is always kept.
+
+1) after one round of proceed and regress, it's hard to proceed again since the c_cur already reaches max value. So, now and then, force proceed when there is new bits, regardless of the result of has_new_packets. Put this logic into main loop or into has_new_packet, force it return 2 at some point.
+2) looks like we still have to remove the lock on Q2 when regress, impl it in destroy Q,
+3) do we need to change out_dir_fd, everytime? we need to call a function similar to setup_dirs_fds in switch_to_Q when regress, because out_dir_fd still points to Q2 and other stuff also such as plot_file
+4) check when is fuzzer_stats updated, fuzz_bitmap updated, and how can we reuse them when regress to Q1 when they are already there.
+	
+5) bug when proceed again, problem is malloc does not zero memory, and free does not zero memory. So the previous still exist
+6) do we need to ck_free Qhead before we ck_free Q??? yes, implement recursive free
+
+
+
+
+
+
+ISSUE:
+
+----------------------------------------------------------------------------------------------------------------------------------
+
+>>>>>>>>>>>>>>>>>>>> short read >>>>>>>>>>>>>>>>>>>>>>>>>>>>
+*) the logic of testing openssl.c is wrong.
+*) when regress, short read from the orig packet of p1, in splicing. maybe there are variables we didnt back up when proceed? check queued_paths and current entry, and queue_cur. 
+*) because we jump out of fuzzing Q1 to proceed to Q2 in the middle of fuzz_one, something may happen to the queue_cur->len, maybe force it to be the lenght of actual len when proceed: 
+*) why did orig packet size increase after proceed_fuzzing: proceed_fuzz, somehow copied orig p2 to orig p1:
+	- point: after proceed_fuzzing, in perform dry run, in calibrate_case, run_target, write(), the file descriptor of fsrv_ctl_fd is not right
+
+*) when proceed fuzzing, in switch_to_Q, it will call setup_dirs_fds, and it will alloc some fds, some are duplicated: /dev/null, /dev/urandom, add condition in setup_dirs_fds, only create them if the Qid_cur == 1,
+
+*) still bug in short read for now, in common_fuzz_stuff, make the return value to 3 if queued_paths is larger than 10, force regression, and remove ret_val for skipped_fuzz, use ret_common_fuzz directly
+
+*) what to do with the queue_cur when regress, queue_cur has been fuzzed partially, not finishing the whole fuzz_one yet. maybe in has_new_packet, add condition: if the queue_cur->invoke_new_packet is true, then it has already been proceeded.: no need to worry because c_max has changed,
+
+*) use strace to debug the shortread problem, at the end , show broken pipe.
+
+*) after proceed fuzzing, when perform dry run, the q2 orig is opened, however, when open q2 orig, the fd is 8, 8 should be always point to "input".
+
+*) something happened in calibrate_case before calling run_target; something happend in write_to_testcase
+
+*) even before proceed_fuzzing, write_to_testcase is wrong, it should not touch the file in p1/queue/orig.
+
+*) solved: afl will link out/orig to in/p1, and openssl will write to p1 per execution, so p1 will change. change link_or_copy, to make it copy instead of link.
+
+<<<<<<<<<<<<<<<<<<<<<<<short red<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+TODO:
+1) shm is mapped twice, if the afl_area_ptr can be obtained from LLVM pass to source code, this can be avoided;
+2) multi q,
+3) Bread-first fuzzing considering only p1 and p2
+4) check AFL_DONT_OPTIMIZE, unset this env var may cause AFL_CLANG_FAST to optimize bbs and bugs cannot be found
+5) in default AFL, compiler instruments each basic block, such that when one basic block executes, the bitmap is updated. It does not read values from the variables inside the TP.
+6) check bg, fg command that bring up the frozen process.
+7) remove the -O0 flag in makefile, make -O3
